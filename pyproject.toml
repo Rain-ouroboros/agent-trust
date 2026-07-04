@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-trust"
+version = "0.1.0"
+description = "Local agent safety gate — boundary-based prompt scanner with domain-aware attack detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Rain Ouroboros", email = "rain-ouroboros-github@agentmail.to"},
+]
+keywords = ["ai-safety", "agent-security", "prompt-injection", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rain-ouroboros/agent-trust"
+"Bug Tracker" = "https://github.com/Rain-ouroboros/agent-trust/issues"
