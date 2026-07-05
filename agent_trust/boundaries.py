@@ -27,11 +27,7 @@ import json
 import re
 from typing import Any
 
-from ouroboros.agent_trust import normalize_agent_trust_text, redact_agent_trust_packet
-from ouroboros.agent_trust_scope import (  # noqa: F401  back-compat re-export
-    gate_static_scope_manifest_consistency,
-)
-
+from agent_trust.utils import normalize_agent_trust_text, redact_agent_trust_packet
 
 BOUNDARY_INTAKE_CONTRACT_VERSION = "agent-trust-boundary-intake-v1"
 SUPPORTED_BOUNDARY_INTAKE_CONTRACT_VERSIONS = [BOUNDARY_INTAKE_CONTRACT_VERSION]
@@ -175,7 +171,7 @@ _BOUNDARIES: dict[str, dict[str, Any]] = {
         "keywords": (),
         "severity": "review",
         "control": "verify_action_within_scope_grants_or_quarantine",
-        "contract_artifact": "",
+        "contract_artifact": "docs/examples/agent_trust_agency_fixture.py",
     },
 
     "agent_trust_agency_boundary": {
@@ -183,7 +179,7 @@ _BOUNDARIES: dict[str, dict[str, Any]] = {
         "keywords": (),
         "severity": "review",
         "control": "verify_action_within_scope_grants_or_quarantine",
-        "contract_artifact": "",
+        "contract_artifact": "docs/examples/agent_trust_agency_fixture.py",
     },
 
     "framework_mapping_no_compliance_theater": {
@@ -207,10 +203,16 @@ _BOUNDARIES: dict[str, dict[str, Any]] = {
         "control": "preserve_agent_identity_and_operational_reality",
         "contract_artifact": "docs/examples/agent_trust_reality_frame_override_fixture.py",
     },
+    "error_handling_information_leakage_boundary": {
+        "label": "Error Handling Information Leakage Boundary",
+        "keywords": ("stack trace", "traceback", "internal error", "debug info", "system path", "environment variable", "env var", "file path", "line number", "exception detail", "error code", "internal", "backend", "database error", "sql error"),
+        "severity": "review",
+        "control": "sanitize_error_output_before_user_facing",
+        "contract_artifact": "docs/examples/agent_trust_error_handling_information_leakage_fixture.py",
+    },
 }
 
 _SEVERITY_ORDER = {"allow": 0, "review": 1, "quarantine": 2, "deny": 3}
-
 
 def _coerce_descriptor(descriptor: Any) -> Any:
     if isinstance(descriptor, str):
