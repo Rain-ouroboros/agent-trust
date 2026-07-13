@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title description">
+  <title id="title">Agent Trust shield</title>
+  <desc id="description">A violet and cyan shield with a deterministic circuit pattern.</desc>
+  <defs>
+    <linearGradient id="background" x1="20" y1="18" x2="140" y2="142" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="43" y1="35" x2="119" y2="127" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A78BFA"/>
+      <stop offset="0.52" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="circuit" x1="54" y1="54" x2="108" y2="111" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#CFFAFE"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="144" height="144" rx="36" fill="url(#background)"/>
+  <rect x="9" y="9" width="142" height="142" rx="35" fill="none" stroke="#334155" stroke-width="2"/>
+  <path d="M80 28 126 44v32c0 30-18 49-46 61-28-12-46-31-46-61V44l46-16Z" fill="url(#shield)" opacity="0.22" stroke="url(#shield)" stroke-width="5"/>
+  <path d="M80 42 112 53v23c0 21-11 35-32 46-21-11-32-25-32-46V53l32-11Z" fill="#0F172A" stroke="url(#shield)" stroke-width="3"/>
+  <g fill="none" stroke="url(#circuit)" stroke-linecap="round" stroke-linejoin="round" stroke-width="4" filter="url(#glow)">
+    <path d="M62 66h12l6 7 7-7h11"/>
+    <path d="M62 94h12l6-7 7 7h11"/>
+    <path d="M80 73v14"/>
+  </g>
+  <g fill="#E0F2FE">
+    <circle cx="60" cy="66" r="4"/>
+    <circle cx="100" cy="66" r="4"/>
+    <circle cx="60" cy="94" r="4"/>
+    <circle cx="100" cy="94" r="4"/>
+    <circle cx="80" cy="80" r="5"/>
+  </g>
+</svg>
