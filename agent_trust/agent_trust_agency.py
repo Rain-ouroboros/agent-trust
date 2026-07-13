@@ -1,9 +1,8 @@
-"""ASI03 Excessive Agency — Scope-based permission model (Phase 1: core).
+"""ASI03 Excessive Agency — scope-based advisory permission model.
 
 Deterministic, stdlib-only, offline. No LLM at runtime.
 Integrates into the existing Agent Trust boundary registry
-(``classify_agent_trust_boundaries``) via a new boundary id
-``excessive_agency_scope_boundary``.
+(``classify_agent_trust_boundaries``) via ``agent_trust_agency_boundary``.
 
 This module is ADVISORY ONLY — it produces a receipt, not an enforcement
 decision. Enforcement wiring is deferred to a separate owner-gated phase.
@@ -15,10 +14,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from ouroboros.agent_trust import normalize_agent_trust_text, redact_agent_trust_packet
+from agent_trust.utils import normalize_agent_trust_text, redact_agent_trust_packet
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,15 @@ READABLE_SCOPES = frozenset({"filesystem", "network", "git", "database"})
 WRITE_ONLY_SCOPES = frozenset(SCOPES) - READABLE_SCOPES
 
 Capability = tuple[str, str]  # ("filesystem", "read") or ("shell", "write")
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    pattern = r"(?<![a-z0-9_])" + re.escape(phrase) + r"(?![a-z0-9_])"
+    return re.search(pattern, text) is not None
+
+
+def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(_contains_phrase(text, phrase) for phrase in phrases)
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +87,12 @@ class ScopeGrants:
 
             {"filesystem": "write", "network": "read", "git": "write"}
         """
+        if not isinstance(d, dict):
+            raise TypeError("scope grants must be a mapping")
         grants: set[Capability] = set()
-        for scope, mode in d.items():
-            scope = scope.strip().lower()
-            mode = mode.strip().lower()
+        for raw_scope, raw_mode in d.items():
+            scope = normalize_agent_trust_text(raw_scope).strip().lower()
+            mode = normalize_agent_trust_text(raw_mode).strip().lower()
             if scope not in SCOPES:
                 continue
             if mode not in ("read", "write"):
@@ -102,25 +114,25 @@ class ScopeGrants:
         text = normalize_agent_trust_text(role_text).lower()
 
         # Strong signals — grant write
-        if any(kw in text for kw in ("file-system", "filesystem", "files", "backup", "storage")):
+        if _contains_any_phrase(text, ("file-system", "filesystem", "files", "backup", "storage")):
             grants["filesystem"] = "write"
-        if any(kw in text for kw in ("shell", "execute", "run command", "subprocess", "cli")):
+        if _contains_any_phrase(text, ("shell", "execute", "run command", "subprocess", "cli")):
             grants["shell"] = "write"
-        if any(kw in text for kw in ("network", "http", "fetch", "crawl", "api call", "web request")):
+        if _contains_any_phrase(text, ("network", "http", "fetch", "crawl", "api call", "web request")):
             grants["network"] = "read"
-        if any(kw in text for kw in ("git", "commit", "push", "pull request", "code review", "pr review")):
+        if _contains_any_phrase(text, ("git", "commit", "push", "pull request", "code review", "pr review")):
             grants["git"] = "write"
-        if any(kw in text for kw in ("secret", "credential", "token", "key management")):
+        if _contains_any_phrase(text, ("secret", "credential", "token", "key management")):
             grants["secrets"] = "write"
-        if any(kw in text for kw in ("post", "publish", "send", "email", "dm", "reply", "outreach", "message", "telegram")):
+        if _contains_any_phrase(text, ("post", "publish", "send", "email", "dm", "reply", "outreach", "message", "telegram")):
             grants["external_action"] = "write"
-        if any(kw in text for kw in ("code execution", "eval", "exec", "sandbox", "run code")):
+        if _contains_any_phrase(text, ("code execution", "eval", "exec", "sandbox", "run code")):
             grants["code_execution"] = "write"
-        if any(kw in text for kw in ("database", "sql", "query", "etl", "pipeline")):
+        if _contains_any_phrase(text, ("database", "sql", "query", "etl", "pipeline")):
             grants["database"] = "write"
 
         # Demotions — "read-only" / "never executes"
-        if any(kw in text for kw in ("read-only", "read only", "reads", "never executes", "no shell", "no execution")):
+        if _contains_any_phrase(text, ("read-only", "read only", "reads", "never executes", "no shell", "no execution")):
             for scope in ("filesystem", "network", "git", "database"):
                 if grants.get(scope) == "write":
                     grants[scope] = "read"
@@ -265,13 +277,43 @@ _SHELL_ARGV_CAPABILITIES: dict[str, Capability] = {
 def _extract_argv0(tool_args: dict) -> str | None:
     """Extract argv[0] from tool_args, handling common shapes."""
     cmd = tool_args.get("cmd")
-    if isinstance(cmd, list) and len(cmd) > 0:
-        arg0 = str(cmd[0])
-        # Handle ``sudo cmd`` — shift to the real command
-        if arg0 == "sudo" and len(cmd) > 1:
-            arg0 = str(cmd[1])
+    argv: list[str]
+    if isinstance(cmd, str):
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            return None
+    elif isinstance(cmd, (list, tuple)):
+        argv = [str(item) for item in cmd]
+    else:
+        return None
+    if argv:
+        arg0 = argv[0]
+        if arg0 == "sudo":
+            positional = [item for item in argv[1:] if not item.startswith("-")]
+            if positional:
+                arg0 = positional[0]
         return arg0
     return None
+
+
+def _extract_command_names(tool_args: dict) -> list[str]:
+    """Return conservative command-name candidates without executing a shell."""
+
+    cmd = tool_args.get("cmd")
+    raw_parts = [cmd] if isinstance(cmd, str) else cmd if isinstance(cmd, (list, tuple)) else []
+    tokens: list[str] = []
+    for part in raw_parts:
+        try:
+            tokens.extend(shlex.split(str(part)))
+        except ValueError:
+            tokens.append(str(part))
+    names: list[str] = []
+    for token in tokens:
+        candidate = token.split("/")[-1]
+        if candidate in _SHELL_ARGV_CAPABILITIES and candidate not in names:
+            names.append(candidate)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +336,8 @@ def classify_action(tool_call: str, tool_args: dict) -> ActionRequirement:
     2. **Shell argv enrichment** — for ``run_shell``, argv[0] ADDS requirements
        (never relaxes).
     """
+    if not isinstance(tool_args, dict):
+        tool_args = {}
     evidence: list[str] = [f"tool:{tool_call}"]
     required: set[Capability] = set()
 
@@ -321,6 +365,39 @@ def classify_action(tool_call: str, tool_args: dict) -> ActionRequirement:
                 extra = _SHELL_ARGV_CAPABILITIES[base]
                 required.add(extra)
                 evidence.append(f"argv_cap:{extra[0]}:{extra[1]}")
+        for command_name in _extract_command_names(tool_args):
+            extra = _SHELL_ARGV_CAPABILITIES[command_name]
+            required.add(extra)
+            marker = f"command_cap:{command_name}:{extra[0]}:{extra[1]}"
+            if marker not in evidence:
+                evidence.append(marker)
+
+        command_text = " ".join(
+            str(item)
+            for item in (
+                tool_args.get("cmd")
+                if isinstance(tool_args.get("cmd"), (list, tuple))
+                else [tool_args.get("cmd") or ""]
+            )
+        )
+        curl_mutation = (
+            re.search(r"\s-X\s*(?:POST|PUT|PATCH|DELETE)\b", command_text) is not None
+            or re.search(
+                r"\s--request(?:=|\s+)(?:post|put|patch|delete)\b",
+                command_text,
+                re.IGNORECASE,
+            )
+            is not None
+            or re.search(
+                r"\s(?:-d(?:\s|=|[^A-Z])|--data(?:-raw|-binary|-urlencode)?(?:=|\s)|"
+                r"-T(?:\s|=)|--upload-file(?:=|\s))",
+                command_text,
+            )
+            is not None
+        )
+        if "curl" in _extract_command_names(tool_args) and curl_mutation:
+            required.add(("network", "write"))
+            evidence.append("curl_mutating_request:network:write")
 
     return ActionRequirement(
         required=frozenset(required),
@@ -401,7 +478,7 @@ def check_scope(
     elif violations:
         # Any mutation out of scope → quarantine
         has_mutating_violation = any(
-            (scope, "write") in req.required for scope, _mode in req.required
+            violation.endswith(":write") for violation in violations
         )
         if has_mutating_violation:
             verdict = "quarantine"
@@ -437,4 +514,17 @@ def check_scope(
     packet["packet_digest"] = digest
     packet["packet_id"] = f"asi03-scope-{digest[:16]}"
 
-    return packet
+    return redact_agent_trust_packet(packet)
+
+
+__all__ = [
+    "ActionRequirement",
+    "Capability",
+    "READABLE_SCOPES",
+    "SCOPES",
+    "ScopeGrants",
+    "WRITE_ONLY_SCOPES",
+    "check_scope",
+    "classify_action",
+    "detect_excessive_agency",
+]

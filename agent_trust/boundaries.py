@@ -6,18 +6,10 @@ transparent review packet before execution, installation, outreach, wallet use,
 posting, or other sensitive behavior.
 
 ADVISORY ONLY — NOT AN ENFORCEMENT LAYER.
-    The ``gate_*`` functions here (and the ``deny``/``review``/``proceed``
-    verdicts and ``zero_trust_default_deny`` control labels they return) are
-    self-assessment RECEIPTS. The agent calls them voluntarily to reason about a
-    proposed action; nothing in the tool-execution path consults their verdicts,
-    so a ``deny`` here does NOT block any tool. Do not mistake this for a
-    sandbox. Actual enforcement lives elsewhere:
-      - ``ouroboros.safety.check_safety`` (LLM supervisor wired into
-        ``tools.registry.execute``; fail-closed on parse/load error),
-      - the hardcoded sandbox in ``tools.registry.execute`` (BIBLE.md/safety.py),
-      - the boot guard (rolls back broken self-edits at startup).
-    If you want a verdict here to actually gate execution, you must wire it into
-    ``tools.registry.execute`` explicitly — it is not wired today.
+    The gate functions and their deny/review/proceed labels are local receipts.
+    Installing this package does not intercept an LLM call or tool execution,
+    and a deny verdict does not block anything by itself.  Callers must wire the
+    result into their own non-bypassable policy boundary.
 """
 
 from __future__ import annotations
@@ -25,11 +17,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from typing import Any
 
 from agent_trust.utils import normalize_agent_trust_text, redact_agent_trust_packet
+from agent_trust.scope import gate_static_scope_manifest_consistency
 
-BOUNDARY_INTAKE_CONTRACT_VERSION = "agent-trust-boundary-intake-v1"
+BOUNDARY_INTAKE_CONTRACT_VERSION = "agent-trust-boundary-intake-v2"
 SUPPORTED_BOUNDARY_INTAKE_CONTRACT_VERSIONS = [BOUNDARY_INTAKE_CONTRACT_VERSION]
 
 
@@ -68,6 +62,28 @@ _BOUNDARIES: dict[str, dict[str, Any]] = {
         "severity": "quarantine",
         "control": "inspect_without_running_until_sandbox_decision",
         "contract_artifact": "state/skill_library_analysis/agent_trust_scanner_execution_sandbox_boundary_contract.md",
+    },
+    "destructive_shell_command_boundary": {
+        "label": "Destructive Shell Command Boundary",
+        "keywords": ("rm -rf", "rm -fr", "fork bomb", "format c:"),
+        "severity": "quarantine",
+        "control": "keep_destructive_commands_out_of_unreviewed_execution_paths",
+        "contract_artifact": "agent_trust/boundaries.py",
+    },
+    "instruction_override_injection_boundary": {
+        "label": "Instruction Override / Prompt Injection Boundary",
+        "keywords": (
+            "ignore previous instructions",
+            "ignore all previous instructions",
+            "disregard previous instructions",
+            "disregard all previous instructions",
+            "reveal the system prompt",
+            "print the system prompt",
+            "override the system prompt",
+        ),
+        "severity": "quarantine",
+        "control": "treat_embedded_instruction_overrides_as_untrusted_data",
+        "contract_artifact": "agent_trust/boundaries.py",
     },
     "cloud_control_plane_authority_boundary": {
         "label": "Cloud / Control-Plane Authority Boundary",
@@ -171,15 +187,7 @@ _BOUNDARIES: dict[str, dict[str, Any]] = {
         "keywords": (),
         "severity": "review",
         "control": "verify_action_within_scope_grants_or_quarantine",
-        "contract_artifact": "docs/examples/agent_trust_agency_fixture.py",
-    },
-
-    "agent_trust_agency_boundary": {
-        "label": "Excessive Agency / Scope-Based Permission Boundary",
-        "keywords": (),
-        "severity": "review",
-        "control": "verify_action_within_scope_grants_or_quarantine",
-        "contract_artifact": "docs/examples/agent_trust_agency_fixture.py",
+        "contract_artifact": "agent_trust/agent_trust_agency.py",
     },
 
     "framework_mapping_no_compliance_theater": {
@@ -232,6 +240,13 @@ def _safe_text(value: Any) -> str:
         return str(value)
 
 
+def _standalone_contract_artifact(rule: dict[str, Any]) -> str:
+    artifact = str(rule.get("contract_artifact") or "")
+    if artifact.startswith("agent_trust/") or artifact in {"README.md", "docs/index.html"}:
+        return artifact
+    return "agent_trust/boundaries.py"
+
+
 def _match_keywords(text: str, keywords: tuple[str, ...]) -> list[str]:
     hits: list[str] = []
     for keyword in keywords:
@@ -245,6 +260,69 @@ def _match_keywords(text: str, keywords: tuple[str, ...]) -> list[str]:
 
 _STATE_STEERING_SYMBOL_RUN = re.compile(r"(?:[^\w\s]{2,}\s*){4,}")
 _STATE_STEERING_REPEAT = re.compile(r"\b([a-z]{2,12})(?:[\s\-_/]+\1){3,}\b", re.IGNORECASE)
+
+_DESTRUCTIVE_SHELL_PATTERNS = (
+    ("filesystem_format", re.compile(r"(?<![a-z0-9_])mkfs(?:\.[a-z0-9_+-]+)?\s+/dev/", re.IGNORECASE)),
+    (
+        "raw_device_overwrite",
+        re.compile(r"(?<![a-z0-9_])dd\s+[^\n;]*\bof=/dev/(?:sd|vd|xvd|nvme|mmcblk)", re.IGNORECASE),
+    ),
+    ("shell_fork_bomb", re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", re.IGNORECASE)),
+)
+
+_RM_COMMAND_SEGMENT = re.compile(
+    r"(?<![a-z0-9_])rm(?=\s)(?:\s+[^\n;|&]{0,4096})?",
+    re.IGNORECASE,
+)
+
+
+def _detect_destructive_rm(text: str) -> list[str]:
+    """Detect recursive deletion of root/home/cwd with linear token parsing."""
+
+    for match in _RM_COMMAND_SEGMENT.finditer(text):
+        command = match.group(0)
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+
+        recursive = False
+        targets: list[str] = []
+        parse_options = True
+        for token in argv[1:]:
+            if parse_options and token == "--":
+                parse_options = False
+                continue
+            if parse_options and token.startswith("--"):
+                option = token.split("=", 1)[0].lower()
+                recursive = recursive or option == "--recursive"
+                continue
+            if parse_options and token.startswith("-") and token != "-":
+                flags = token[1:]
+                recursive = recursive or "r" in flags.lower()
+                continue
+            targets.append(token)
+
+        for target in targets:
+            normalized = target.strip()
+            dangerous_target = (
+                normalized in {"/", "/.", "/..", "~", "~/", "*", ".", "./", "./*"}
+                or normalized.startswith("/*")
+                or normalized.startswith("~/")
+            )
+            if recursive and dangerous_target:
+                return ["recursive_root_or_home_delete"]
+    return []
+
+
+def _detect_destructive_shell(text: str) -> list[str]:
+    signals = _detect_destructive_rm(text)
+    signals.extend(
+        signal
+        for signal, pattern in _DESTRUCTIVE_SHELL_PATTERNS
+        if pattern.search(text)
+    )
+    return signals
 
 
 def _detect_latent_state_steering(text: str) -> list[str]:
@@ -346,7 +424,7 @@ def agent_trust_boundary_catalog() -> list[dict[str, Any]]:
             "severity": str(rule["severity"]),
             "control": str(rule["control"]),
             "keywords": list(rule["keywords"]),
-            "contract_artifact": str(rule["contract_artifact"]),
+            "contract_artifact": _standalone_contract_artifact(rule),
         }
         for key, rule in _BOUNDARIES.items()
     ]
@@ -354,27 +432,38 @@ def agent_trust_boundary_catalog() -> list[dict[str, Any]]:
 
 
 
-def _detect_agent_trust_agency(text: str) -> list[str]:
+def _detect_agent_trust_agency(descriptor: Any) -> list[str]:
     """Detect excessive agency — scope violations via agent_trust_agency."""
+    if not isinstance(descriptor, dict) or "actions" not in descriptor:
+        return []
     try:
-        import json
-        from ouroboros.agent_trust_agency import check_scope, ScopeGrants
-        if not isinstance(text, str) or len(text) < 16:
-            return []
-        descriptor = json.loads(text) if text.strip().startswith('{') else None
-        if not isinstance(descriptor, dict):
-            return []
-        grants = ScopeGrants.from_role_text(descriptor.get("agent_role", ""))
-        hits = []
+        from agent_trust.agent_trust_agency import ScopeGrants, check_scope
+
+        agent_id = str(descriptor.get("agent_id") or "anonymous")
+        explicit_grants = descriptor.get("scope_grants")
+        if not isinstance(explicit_grants, dict):
+            explicit_grants = descriptor.get("grants")
+        if isinstance(explicit_grants, dict):
+            grants = ScopeGrants.from_dict(agent_id, explicit_grants)
+        else:
+            grants = ScopeGrants.from_role_text(agent_id, str(descriptor.get("agent_role") or ""))
+
+        hits: list[str] = []
         for action in descriptor.get("actions", []):
             if not isinstance(action, dict):
+                hits.append("malformed_action_descriptor")
                 continue
-            verdict, _ = check_scope(grants, action.get("tool", ""), action.get("args", []))
-            if verdict != "allow":
-                hits.append("scope_violation:" + action.get("tool", "unknown"))
+            tool = str(action.get("tool") or "unknown")
+            safe_tool = str(redact_agent_trust_packet(tool))
+            tool_args = action.get("args")
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            packet = check_scope(tool, tool_args, grants)
+            if packet["verdict"] != "allow":
+                hits.append(f"scope_{packet['verdict']}:{safe_tool}")
         return hits
     except Exception:
-        return []
+        return ["agency_analyzer_error_fail_closed"]
 
 def classify_agent_trust_boundaries(descriptor: Any, *, contract_version: str | None = None) -> dict[str, Any]:
     """Classify a descriptor into Agent Trust defensive boundary families.
@@ -401,11 +490,17 @@ def classify_agent_trust_boundaries(descriptor: Any, *, contract_version: str | 
         hits = _match_keywords(text, rule["keywords"])
         if key == "latent_state_steering_boundary":
             hits = [*hits, *_detect_latent_state_steering(text)]
-            if key == "agent_trust_agency_boundary":
-                hits = [*hits, *_detect_agent_trust_agency(text)]
+        if key == "destructive_shell_command_boundary":
+            hits = [*hits, *_detect_destructive_shell(text)]
+        if key == "agent_trust_agency_boundary":
+            hits = [*hits, *_detect_agent_trust_agency(normalized)]
         if not hits:
             continue
         severity = str(rule["severity"])
+        if key == "agent_trust_agency_boundary" and any(
+            hit.startswith("scope_quarantine:") for hit in hits
+        ):
+            severity = "quarantine"
         controls.add(str(rule["control"]))
         reasons.append(f"matched_{key}")
         if _SEVERITY_ORDER[severity] > _SEVERITY_ORDER[verdict]:
@@ -417,7 +512,7 @@ def classify_agent_trust_boundaries(descriptor: Any, *, contract_version: str | 
                 "severity": severity,
                 "matched_signals": hits,
                 "required_control": rule["control"],
-                "contract_artifact": rule["contract_artifact"],
+                "contract_artifact": _standalone_contract_artifact(rule),
             }
         )
 
@@ -858,18 +953,20 @@ __all__ = [
     "gate_zero_trust_agent_action",
     "gate_runtime_pre_action_with_signals",
     "gate_static_scope_manifest_consistency",
+    "evaluate_agent_trust_change_control",
 ]
 
 
 CHANGE_CONTROL_CONTRACT_VERSION = "agent-trust-change-control-v1"
 SUPPORTED_CHANGE_CONTROL_CONTRACT_VERSIONS = [CHANGE_CONTROL_CONTRACT_VERSION]
 _SECURITY_CRITICAL_SURFACES: dict[str, str] = {
-    "ouroboros/agent_trust.py": "redaction_classification_core",
-    "ouroboros/agent_trust_boundaries.py": "verdict_logic_and_gates",
-    "docs/examples/schemas/agent_trust_request.schema.json": "request_schema_contract",
-    "docs/examples/schemas/agent_trust_bundle.schema.json": "bundle_schema_contract",
-    "docs/agent_trust_threat_model.md": "threat_model_and_residual_risk",
-    "docs/agent_trust.md": "public_advisory_boundary_claims",
+    "agent_trust/scanner.py": "public_prompt_scanner",
+    "agent_trust/utils.py": "redaction_and_canonicalization",
+    "agent_trust/boundaries.py": "verdict_logic_and_gates",
+    "agent_trust/scope.py": "static_scope_consistency",
+    "agent_trust/agent_trust_agency.py": "agency_scope_classifier",
+    "readme.md": "public_advisory_boundary_claims",
+    "pyproject.toml": "package_contract",
 }
 _WEAKENING_CHANGE_TERMS = (
     "remove redaction",

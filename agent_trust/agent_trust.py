@@ -1,4 +1,4 @@
-"""Local pre-action trust bundle combining x402 quote and tool/MCP risk signals."""
+"""Compatibility APIs plus the optional Ouroboros-integrated trust bundle."""
 
 from __future__ import annotations
 
@@ -6,11 +6,19 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import re
-import unicodedata
 from typing import Any
 
-from ouroboros.tool_risk import AUTH_KEYS, DANGEROUS_WORDS, EXEC_KEYS, FS_KEYS, NETWORK_KEYS, RISK_ORDER
-from ouroboros.x402_policy import quote_x402_policy
+from agent_trust.scanner import (
+    AgentTrustGate,
+    PromptVerdict,
+    check_prompt,
+    check_prompts_batch,
+)
+from agent_trust.utils import (
+    canonicalize_agent_trust_packet,
+    normalize_agent_trust_text,
+    redact_agent_trust_packet,
+)
 
 
 AGENT_TRUST_BUNDLE_CONTRACT_VERSION = "agent-trust-bundle-v1"
@@ -21,6 +29,10 @@ AGENT_TRUST_MAX_JSON_NESTING_DEPTH = 32
 
 class AgentTrustInputGuardError(ValueError):
     """Sanitized error for rejecting untrusted Agent Trust JSON input."""
+
+
+class AgentTrustIntegrationUnavailable(RuntimeError):
+    """Raised when an Ouroboros-only bundle helper is used standalone."""
 
 
 def guard_agent_trust_json_text(raw: str | bytes) -> None:
@@ -50,128 +62,6 @@ def guard_agent_trust_json_depth(value: Any) -> None:
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             stack.extend((child, depth + 1) for child in item)
-
-
-_SECRET_KEY_MARKERS = (
-    "api_key",
-    "apikey",
-    "auth",
-    "bearer",
-    "credential",
-    "mnemonic",
-    "password",
-    "private_key",
-    "secret",
-    "seed",
-    "token",
-)
-_SECRET_VALUE_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE | re.DOTALL),
-    re.compile(r"(?i)\b(?:sk|pk|rk|ghp|github_pat|xox[baprs]|ya29|AKIA)[-_A-Za-z0-9]{10,}\b"),
-    re.compile(r"(?i)\b(?:bearer|token|api[_ -]?key|secret|password)\s*[:=]\s*[^\s,;]{8,}"),
-    re.compile(r"(?i)\bbearer\s+[-_A-Za-z0-9.]{8,}\b"),
-    re.compile(r"(?i)\b(?:[a-z]+\s+){11,23}[a-z]+\b"),
-)
-_REDACTED_SECRET = "[REDACTED_SECRET]"
-_HOMOGLYPH_TRANSLATION = str.maketrans(
-    {
-        "а": "a",  # Cyrillic small a
-        "А": "A",
-        "е": "e",  # Cyrillic small ie
-        "Е": "E",
-        "о": "o",  # Cyrillic small o
-        "О": "O",
-        "р": "p",  # Cyrillic small er
-        "Р": "P",
-        "с": "c",  # Cyrillic small es
-        "С": "C",
-        "х": "x",  # Cyrillic small ha
-        "Х": "X",
-        "у": "y",  # Cyrillic small u
-        "У": "Y",
-        "і": "i",  # Cyrillic/Latin-confusable i
-        "І": "I",
-        "ⅼ": "l",  # Roman numeral fifty
-        "０": "0",
-        "１": "1",
-        "２": "2",
-        "３": "3",
-        "４": "4",
-        "５": "5",
-        "６": "6",
-        "７": "7",
-        "８": "8",
-        "９": "9",
-    }
-)
-
-
-def normalize_agent_trust_text(value: Any) -> str:
-    """Normalize adversarial text for advisory matching/redaction.
-
-    This is intentionally small and dependency-free: strip Unicode formatting
-    controls such as zero-width joiners, apply NFKC, and map a tiny set of
-    common homoglyphs used to hide security-sensitive words. It is not a proof
-    of semantic safety; it only makes obvious evasions visible to local checks.
-    """
-    text = unicodedata.normalize("NFKC", str(value)).translate(_HOMOGLYPH_TRANSLATION)
-    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
-
-
-def _looks_like_secret_key(key: Any) -> bool:
-    normalized = normalize_agent_trust_text(key).lower().replace("-", "_").replace(" ", "_")
-    return any(marker in normalized for marker in _SECRET_KEY_MARKERS)
-
-
-def _redact_secret_text(value: str) -> str:
-    redacted = value
-    normalized = normalize_agent_trust_text(value)
-    for pattern in _SECRET_VALUE_PATTERNS:
-        redacted = pattern.sub(_REDACTED_SECRET, redacted)
-        if redacted == value and pattern.search(normalized):
-            return _REDACTED_SECRET
-    redacted = re.sub(r"(?i)(https?://)([^/@\s:]{3,}:[^/@\s]{3,}@)", r"\1[REDACTED_USERINFO]@", redacted)
-    return redacted
-
-
-def redact_agent_trust_packet(value: Any, *, parent_key: str | None = None) -> Any:
-    """Return a JSON-safe copy with secret-shaped material removed.
-
-    Agent Trust packets are advisory evidence artifacts and may become logs,
-    receipts, or review bundles. They must never echo raw secret-looking input
-    values. This redactor is conservative: key names associated with secrets
-    redact their value even if the value itself is not pattern-matched.
-    """
-    if isinstance(value, dict):
-        return {str(key): redact_agent_trust_packet(item, parent_key=str(key)) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_agent_trust_packet(item, parent_key=parent_key) for item in value]
-    if isinstance(value, tuple):
-        return [redact_agent_trust_packet(item, parent_key=parent_key) for item in value]
-    if isinstance(value, set):
-        return sorted(redact_agent_trust_packet(item, parent_key=parent_key) for item in value)
-    if isinstance(value, str):
-        if parent_key is not None and _looks_like_secret_key(parent_key) and value.strip():
-            return _REDACTED_SECRET
-        return _redact_secret_text(value)
-    return value
-
-
-def canonicalize_agent_trust_packet(packet: Any) -> bytes:
-    """Return deterministic canonical bytes for the redacted packet.
-
-    The digest surface intentionally hashes the packet after conservative
-    redaction. It is local integrity evidence only: no signing, timestamping,
-    authentication, network call, wallet access, or execution is performed.
-    """
-    redacted = redact_agent_trust_packet(packet)
-    return json.dumps(
-        redacted,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
 
 
 def agent_trust_packet_digest(packet: Any) -> str:
@@ -432,7 +322,28 @@ def _normalize_provenance_evidence(provenance_evidence: Any = None) -> dict[str,
 
 
 def _build_agent_trust_bundle(policy: dict[str, Any], ledger: list[dict[str, Any]] | None = None, resource: str | None = None, tool_descriptor: Any = None, *, contract_version: str | None = None, intended_integration_context: str | None = None, provenance_evidence: Any = None, registered_tool_manifest: list[dict[str, Any]] | None = None, loaded_tool_count: int = 0) -> dict[str, Any]:
-    """Build a deterministic no-network/no-wallet/no-execution pre-action trust report."""
+    """Build the optional Ouroboros-integrated trust bundle.
+
+    The standalone package can scan prompts and produce boundary receipts with
+    no extra dependency.  This legacy bundle additionally needs Ouroboros x402
+    policy and tool-risk modules, which are imported only when called.
+    """
+    try:
+        from ouroboros.tool_risk import (
+            AUTH_KEYS,
+            DANGEROUS_WORDS,
+            EXEC_KEYS,
+            FS_KEYS,
+            NETWORK_KEYS,
+            RISK_ORDER,
+        )
+        from ouroboros.x402_policy import quote_x402_policy
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise AgentTrustIntegrationUnavailable(
+            "build_agent_trust_bundle requires the optional Ouroboros "
+            "tool-risk and x402-policy integration"
+        ) from exc
+
     negotiated_contract_version = contract_version or AGENT_TRUST_BUNDLE_CONTRACT_VERSION
     if negotiated_contract_version not in SUPPORTED_AGENT_TRUST_BUNDLE_CONTRACT_VERSIONS:
         supported = ", ".join(SUPPORTED_AGENT_TRUST_BUNDLE_CONTRACT_VERSIONS)
@@ -498,3 +409,26 @@ def _build_agent_trust_bundle(policy: dict[str, Any], ledger: list[dict[str, Any
 
 
 build_agent_trust_bundle = _build_agent_trust_bundle
+
+
+__all__ = [
+    "AGENT_TRUST_BUNDLE_CONTRACT_VERSION",
+    "AGENT_TRUST_MAX_JSON_INPUT_BYTES",
+    "AGENT_TRUST_MAX_JSON_NESTING_DEPTH",
+    "AgentTrustGate",
+    "AgentTrustInputGuardError",
+    "AgentTrustIntegrationUnavailable",
+    "PromptVerdict",
+    "SUPPORTED_AGENT_TRUST_BUNDLE_CONTRACT_VERSIONS",
+    "agent_trust_packet_digest",
+    "attest_agent_trust_packet",
+    "build_agent_trust_bundle",
+    "canonicalize_agent_trust_packet",
+    "check_prompt",
+    "check_prompts_batch",
+    "guard_agent_trust_json_depth",
+    "guard_agent_trust_json_text",
+    "normalize_agent_trust_text",
+    "redact_agent_trust_packet",
+    "verify_agent_trust_attestation",
+]

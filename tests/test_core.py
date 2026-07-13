@@ -51,7 +51,11 @@ class TestBoundaries:
             assert "severity" in boundary, f"{key} missing severity"
 
     def test_boundaries_count(self):
-        assert len(_BOUNDARIES) == 23
+        assert len(_BOUNDARIES) == 25
+
+    def test_security_boundaries_are_present(self):
+        assert "destructive_shell_command_boundary" in _BOUNDARIES
+        assert "instruction_override_injection_boundary" in _BOUNDARIES
 
     def test_gate_zero_trust_returns_decision(self):
         """Gate returns a pre_action_decision field."""
